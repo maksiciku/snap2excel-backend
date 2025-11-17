@@ -9,6 +9,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const path = require('path');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const sharp = require('sharp');
 
 const JWT_SECRET = 'super-secret-snap2excel-key-change-later'; // later we move to env var
 
@@ -95,6 +96,42 @@ db.run(`ALTER TABLE users ADD COLUMN subscription_status TEXT DEFAULT 'none'`, (
   }
 });
 
+db.run(`ALTER TABLE users ADD COLUMN full_name TEXT`, (err) => {
+  if (err && !String(err.message).includes('duplicate column')) {
+    console.error('Error adding full_name column:', err.message);
+  }
+});
+
+db.run(`ALTER TABLE users ADD COLUMN account_type TEXT DEFAULT 'personal'`, (err) => {
+  if (err && !String(err.message).includes('duplicate column')) {
+    console.error('Error adding account_type column:', err.message);
+  }
+});
+
+db.run(`ALTER TABLE users ADD COLUMN business_name TEXT`, (err) => {
+  if (err && !String(err.message).includes('duplicate column')) {
+    console.error('Error adding business_name column:', err.message);
+  }
+});
+
+db.run(`ALTER TABLE users ADD COLUMN country TEXT`, (err) => {
+  if (err && !String(err.message).includes('duplicate column')) {
+    console.error('Error adding country column:', err.message);
+  }
+});
+
+db.run(`ALTER TABLE users ADD COLUMN city TEXT`, (err) => {
+  if (err && !String(err.message).includes('duplicate column')) {
+    console.error('Error adding city column:', err.message);
+  }
+});
+
+db.run(`ALTER TABLE users ADD COLUMN role TEXT`, (err) => {
+  if (err && !String(err.message).includes('duplicate column')) {
+    console.error('Error adding role column:', err.message);
+  }
+});
+
 // Create receipts table (if not exists)
 db.run(`
   CREATE TABLE IF NOT EXISTS receipts (
@@ -120,6 +157,20 @@ db.run(`ALTER TABLE receipts ADD COLUMN category TEXT`, (err) => {
     console.error('Error adding category column:', err.message);
   }
 });
+
+db.run(`ALTER TABLE receipts ADD COLUMN enhanced INTEGER DEFAULT 0`, () => {});
+
+// Personal finance settings (one row per user)
+db.run(`
+  CREATE TABLE IF NOT EXISTS user_finance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER UNIQUE,
+    income_amount REAL,
+    income_frequency TEXT, -- 'weekly' or 'monthly'
+    bills_json TEXT,       -- JSON array of { name, amount, frequency }
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  )
+`);
 
 
 // ---- Multer upload config ----
@@ -160,16 +211,74 @@ function isLikelyShopName(line) {
   return true;
 }
 
+function cleanShopString(line) {
+  return line
+    .replace(/[<>]/g, '')        // remove weird bracket chars
+    .replace(/\s{2,}/g, ' ')     // collapse double spaces
+    .trim();
+}
+
 function findShopName(text) {
-  const lines = cleanLines(text);
-  for (const line of lines) {
-    if (isLikelyShopName(line)) {
-      return line;
+  // Use the cleaned lines helper we already have
+  const lines = cleanLines(text); // collapses spaces + removes blanks
+
+  // Only look at the first N lines – header area
+  const headerLines = lines.slice(0, 10);
+
+  const footerBadWords = [
+    'thank you',
+    'shopping',
+    'please keep',
+    'receipt',
+    'invoice',
+    'tax invoice',
+    'vat invoice',
+  ];
+
+  const knownStores = [
+    'Tesco', 'Asda', 'Aldi', 'Lidl', 'Morrisons', 'Coop', 'Co-op', 'Boots',
+    'Sainsbury', 'Costa', 'Starbucks', 'McDonalds', 'KFC', 'Burger King',
+    'Dominos', 'Subway', 'Primark', 'Ikea', 'B&M', 'Wilko', 'Home Bargains',
+    'Supermart' // our test one
+  ];
+
+  // 1) Exact brand match in header
+  for (const line of headerLines) {
+    const lower = line.toLowerCase();
+    for (const store of knownStores) {
+      if (lower.includes(store.toLowerCase())) {
+        return store;
+      }
     }
   }
-  // fallback: first non-empty line
-  return lines[0] || '';
+
+  // 2) First line in the header that "looks like" a shop name
+  for (const line of headerLines) {
+    if (isLikelyShopName(line)) {
+      return cleanShopString(line);
+    }
+  }
+
+  // 3) Fallback: any line with letters that is NOT a footer / thank-you text
+  for (const line of lines) {
+    const clean = cleanShopString(line);
+    const lower = clean.toLowerCase();
+
+    if (!/[a-zA-Z]/.test(clean)) continue; // must have letters
+
+    if (footerBadWords.some((w) => lower.includes(w))) {
+      continue; // skip "THANK YOU FOR SHOPPING", "RECEIPT" etc.
+    }
+
+    if (clean.length >= 3 && clean.length <= 40) {
+      return clean;
+    }
+  }
+
+  // 4) Last resort
+  return 'Unknown shop';
 }
+
 
 function findDate(text) {
   // Handle common UK/EU/ISO patterns
@@ -338,41 +447,89 @@ function normalizeMonth(dateStr) {
   return `${year}-${String(month).padStart(2, '0')}`;
 }
 
+function requirePro(req, res) {
+  if (!req.user || req.user.plan_type === 'free') {
+    return res.status(403).json({
+      error: 'This feature is for Pro users. Upgrade in your profile to unlock it.',
+    });
+  }
+  return null;
+}
+
 // ---- Auth routes ----
 
 // Register new user
 app.post('/api/register', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password required' });
-  }
-
   try {
-    const password_hash = await bcrypt.hash(password, 10);
+    const {
+      full_name,
+      email,
+      password,
+      account_type,
+      business_name,
+      country,
+      city,
+      role,
+    } = req.body;
 
-    db.run(
-      `INSERT INTO users (email, password_hash) VALUES (?, ?)`,
-      [email, password_hash],
-      function (err) {
-        if (err) {
-          if (String(err.message).includes('UNIQUE')) {
-            return res.status(400).json({ error: 'Email already registered' });
-          }
-          console.error('Register error:', err);
-          return res.status(500).json({ error: 'DB error' });
-        }
+    if (!full_name || !email || !password || !account_type) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
 
-        const user = { id: this.lastID, email };
-        const token = jwt.sign(user, JWT_SECRET, { expiresIn: '7d' });
-
-        res.json({ token, user });
+    // Check if user exists
+    db.get('SELECT id FROM users WHERE email = ?', [email], async (err, row) => {
+      if (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Database error' });
       }
-    );
-  } catch (err) {
-    console.error('Register hash error:', err);
+      if (row) {
+        return res.status(400).json({ error: 'Email already registered' });
+      }
+
+      const saltRounds = 10;
+      const hash = await bcrypt.hash(password, saltRounds);
+
+      db.run(
+        `
+        INSERT INTO users
+          (full_name, email, password_hash, account_type, business_name, country, city, role, plan_type, is_admin)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          full_name,
+          email,
+          hash,
+          account_type,
+          business_name || null,
+          country || null,
+          city || null,
+          role || null,
+          'free',  // default plan for now
+          0,       // not admin
+        ],
+        function (err2) {
+          if (err2) {
+            console.error(err2);
+            return res.status(500).json({ error: 'Failed to create user' });
+          }
+
+          // You can auto-login here and return token, like before
+          const userId = this.lastID;
+          const token = jwt.sign({ id: userId }, JWT_SECRET, {
+  expiresIn: '7d',
+});
+
+
+          res.json({ token });
+        }
+      );
+    });
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: 'Server error' });
   }
 });
+
 
 // Login existing user
 app.post('/api/login', (req, res) => {
@@ -424,6 +581,12 @@ db.get(
   `SELECT
      id,
      email,
+     full_name,
+     account_type,
+     business_name,
+     country,
+     city,
+     role,
      plan_type,
      billing_info,
      profile_photo,
@@ -710,6 +873,88 @@ app.get('/api/admin/analytics', authenticateToken, requireAdmin, (req, res) => {
   );
 });
 
+async function mlCorrectReceipt(parsed, fullText) {
+  // If no API key, just skip ML correction
+  if (!process.env.OPENAI_API_KEY) {
+    console.warn('ML correction skipped: OPENAI_API_KEY not set');
+    return null;
+  }
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are an assistant that cleans up noisy OCR from receipts. ' +
+              'You must return a STRICT JSON object with fields: shop, date, total, vat. ' +
+              'Total and vat must be numbers in pounds (use dot decimal). Date in format MM/DD/YYYY if possible.',
+          },
+          {
+            role: 'user',
+            content:
+              'Here is noisy OCR text from a receipt. Fix it and extract the key fields.\n\n' +
+              'OCR_TEXT:\n' +
+              fullText +
+              '\n\n' +
+              'CURRENT_PARSED_JSON:\n' +
+              JSON.stringify(parsed),
+          },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      console.error('ML correction HTTP error:', response.status, errText);
+      return null;
+    }
+
+    const data = await response.json();
+    let content = data.choices?.[0]?.message?.content || '{}';
+
+    let ml;
+    try {
+      ml = JSON.parse(content);
+    } catch (e) {
+      // Sometimes the model already returns JSON, sometimes stringified JSON.
+      ml = content;
+    }
+
+    if (!ml || typeof ml !== 'object') return null;
+
+    const cleaned = {
+      shop: ml.shop || parsed.shop || null,
+      date: ml.date || parsed.date || null,
+      total:
+        typeof ml.total === 'number'
+          ? ml.total
+          : ml.total
+          ? Number(String(ml.total).replace(',', '.'))
+          : parsed.total || null,
+      vat:
+        typeof ml.vat === 'number'
+          ? ml.vat
+          : ml.vat
+          ? Number(String(ml.vat).replace(',', '.'))
+          : parsed.vat || null,
+    };
+
+    return cleaned;
+  } catch (err) {
+    console.error('ML correction error:', err);
+    return null;
+  }
+}
+
 // Last Stripe events (simple log preview)
 app.get('/api/admin/stripe/events', authenticateToken, requireAdmin, async (req, res) => {
   try {
@@ -746,64 +991,216 @@ app.get('/api/admin/stripe/subscriptions', authenticateToken, requireAdmin, asyn
   }
 });
 
-app.post('/api/scan-receipt', authenticateToken, upload.single('receipt'), async (req, res) => {
-  const filePath = req.file.path;
-  const mime = req.file.mimetype;
-  const ext = path.extname(req.file.originalname || '').toLowerCase();
+async function preprocessForOcr(srcPath) {
+  const processedPath = `${srcPath}-ocr.png`;
 
-    try {
-    let text;
+  // Resize, grayscale, normalize contrast, auto-rotate
+  await sharp(srcPath)
+    .rotate() // use EXIF orientation
+    .resize(1800, null, { fit: 'inside' }) // keep it big enough but not huge
+    .grayscale()
+    .normalize()
+    .toFile(processedPath);
 
-    // Reject PDFs for now – keep system stable
-    if (mime === 'application/pdf' || ext === '.pdf') {
-      fs.unlinkSync(filePath);
-      return res.status(400).json({
-        error: 'PDF files are not supported yet. Please upload a photo (JPG/PNG) or screenshot of the receipt.',
-      });
-    }
+  return processedPath;
+}
 
-    // Image → use Tesseract
-    const result = await Tesseract.recognize(filePath, 'eng');
-    text = result.data.text || '';
+app.post('/api/scan-receipt',
+  authenticateToken,
+  upload.single('receipt'),
+  (req, res) => {
+    const filePath = req.file.path;
+    const mime = req.file.mimetype;
+    const ext = path.extname(req.file.originalname || '').toLowerCase();
 
-    if (!text || text.trim().length === 0) {
-      fs.unlinkSync(filePath);
-      return res.status(400).json({ error: 'Could not read any text from file' });
-    }
+    const FREE_RECEIPT_LIMIT = 50;
+    
+    async function processFile() {
+      let ocrPath = filePath;
+      let processedPath = null;
 
-    const parsed = parseReceiptText(text);
+      try {
+        const isPdf = mime === 'application/pdf' || ext === '.pdf';
+        const isHeic = mime === 'image/heic' || mime === 'image/heif' || ext === '.heic' || ext === '.heif';
 
-    db.run(
-      `INSERT INTO receipts (shop, date, total, vat, raw_text, user_id, category)
- VALUES (?, ?, ?, ?, ?, ?, ?)`,
-[parsed.shop, parsed.date, parsed.total, parsed.vat, text, req.user.id, parsed.category],
-
-      function (err) {
-        fs.unlinkSync(filePath); // delete temp file
-
-        if (err) {
-          console.error(err);
-          return res.status(500).json({ error: 'DB error' });
+        if (isPdf) {
+          return res.status(400).json({ error: "PDF not supported" });
         }
 
-        res.json({
-          id: this.lastID,
-          ...parsed,
-          raw_text: text,
-        });
-      }
-    );
-  } catch (err) {
-    console.error('scan-receipt error:', err);
-    try {
-      fs.unlinkSync(filePath);
-    } catch (e) {
-      // ignore
-    }
-    res.status(500).json({ error: 'OCR failed' });
-  }
+        if (isHeic) {
+          return res.status(400).json({ error: "HEIC blocked – please screenshot" });
+        }
 
-});
+        const allowedImageTypes = ['image/jpeg', 'image/jpg', 'image/png'];
+        if (!allowedImageTypes.includes(mime)) {
+          return res.status(400).json({ error: 'Unsupported image type' });
+        }
+
+        // Preprocessing
+        try {
+          processedPath = await preprocessForOcr(filePath);
+          ocrPath = processedPath;
+        } catch (err) {
+          console.error('Preprocess failed, using original:', err);
+        }
+
+        // Initial OCR pass
+        const result = await Tesseract.recognize(ocrPath, 'eng', {
+          tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz£.:/-, ',
+          tessedit_pageseg_mode: 6,
+        });
+
+        const text = result.data.text || '';
+        if (!text.trim()) {
+          return res.status(400).json({ error: "Unreadable image" });
+        }
+
+        const parsed = parseReceiptText(text);
+
+        db.run(
+          `INSERT INTO receipts (shop, date, total, vat, raw_text, user_id, category, enhanced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+          [
+            parsed.shop,
+            parsed.date,
+            parsed.total,
+            parsed.vat,
+            text,
+            req.user.id,
+            parsed.category,
+          ],
+          function (err) {
+            if (err) {
+              console.error(err);
+              return res.status(500).json({ error: "DB write error" });
+            }
+
+            const receiptId = this.lastID;
+
+            // === Immediate response to user ===
+            res.json({
+              id: receiptId,
+              ...parsed,
+              raw_text: text,
+              enhanced: 0,
+            });
+
+            // === Background Enhanced Scan ===
+            setTimeout(() => {
+              runEnhancedScan(receiptId, filePath).catch(err =>
+                console.error("Enhanced scan failed:", err)
+              );
+            }, 200);
+
+          }
+        );
+
+      } catch (err) {
+        console.error('scan-receipt error:', err);
+        return res.status(500).json({ error: "OCR failed" });
+      }
+    }
+
+    if (req.user.plan_type === 'free') {
+      db.get(`SELECT COUNT(*) AS cnt FROM receipts WHERE user_id = ?`, [req.user.id], (err, row) => {
+        if (err) return res.status(500).json({ error: "DB error" });
+
+        if (row && row.cnt >= FREE_RECEIPT_LIMIT) {
+          return res.status(403).json({ error: "Free plan limit reached" });
+        }
+
+        processFile(); // allowed
+      });
+    } else {
+      processFile();
+    }
+  }
+);
+
+
+async function runEnhancedScan(receiptId, originalPath) {
+  try {
+    const enhancedPath = `${originalPath}-enhanced.png`;
+
+    // Advanced preprocessing (local, no AI)
+    await sharp(originalPath)
+      .grayscale()
+      .normalize()   // or .normalise(), both are fine in sharp
+      .sharpen()
+      .resize(2100)  // HQ OCR size
+      .toFile(enhancedPath);
+
+    // Second OCR pass on the enhanced image
+    const result = await Tesseract.recognize(enhancedPath, 'eng', {
+      tessedit_char_whitelist:
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789£:.%/- ',
+      tessedit_pageseg_mode: 6,
+    });
+
+    const improvedText = (result.data.text || '').trim();
+    const improved = parseReceiptText(improvedText); // your existing parser
+
+    // Compare with what we already have in the DB
+    db.get('SELECT * FROM receipts WHERE id = ?', [receiptId], (err, row) => {
+      if (err) {
+        console.error('Enhanced scan DB error:', err);
+        return;
+      }
+      if (!row) {
+        console.warn(`Enhanced scan: receipt #${receiptId} not found`);
+        return;
+      }
+
+      // Decide what is "better"
+      const betterShop =
+        improved.shop && improved.shop.length > (row.shop?.length || 0);
+
+      const betterTotal =
+        typeof improved.total === 'number' &&
+        improved.total > 0 &&
+        (!row.total || improved.total >= row.total);
+
+      const betterVat =
+        typeof improved.vat === 'number' &&
+        improved.vat >= 0 &&
+        (!row.vat || improved.vat >= row.vat);
+
+      const betterText =
+        improvedText.length > (row.raw_text?.length || 0);
+
+      if (betterShop || betterTotal || betterVat || betterText) {
+        const newShop = betterShop ? improved.shop : row.shop;
+        const newTotal = betterTotal ? improved.total : row.total;
+        const newVat = betterVat ? improved.vat : row.vat;
+        const newText = betterText ? improvedText : row.raw_text;
+
+        db.run(
+          `UPDATE receipts
+           SET shop = ?, total = ?, vat = ?, raw_text = ?, enhanced = 1
+           WHERE id = ?`,
+          [newShop, newTotal, newVat, newText, receiptId],
+          (uErr) => {
+            if (uErr) {
+              console.error('Enhanced update error:', uErr);
+            } else {
+              console.log(
+                `Receipt #${receiptId} improved via enhanced scan (no ML)`
+              );
+            }
+          }
+        );
+      } else {
+        console.log(`Receipt #${receiptId} unchanged after enhanced scan`);
+      }
+    });
+
+    // Clean up temp file
+    fs.unlink(enhancedPath, () => {});
+  } catch (error) {
+    console.error('Enhanced scan process error:', error);
+  }
+}
+
 
 // ---- Route: list receipts ----
 app.get('/api/receipts', authenticateToken, (req, res) => {
@@ -908,30 +1305,38 @@ app.get('/api/dashboard', authenticateToken, (req, res) => {
   );
 });
 
-// ---- Route: export CSV ----
 app.get('/api/export/csv', authenticateToken, (req, res) => {
+  // Lock CSV export for free users
+  if (requirePro(req, res)) return;
+
   db.all(
     `SELECT * FROM receipts WHERE user_id = ? ORDER BY id ASC`,
     [req.user.id],
     (err, rows) => {
+      if (err) return res.status(500).json({ error: 'DB error' });
 
-    if (err) return res.status(500).json({ error: 'DB error' });
+      const header = 'Shop,Date,Total,VAT\n';
+      const lines = rows.map(r =>
+        `"${r.shop || ''}",${r.date || ''},${r.total || ''},${r.vat || ''}`
+      );
+      const csv = header + lines.join('\n');
 
-    const header = 'Shop,Date,Total,VAT\n';
-    const lines = rows.map(r =>
-      `"${r.shop || ''}",${r.date || ''},${r.total || ''},${r.vat || ''}`
-    );
-    const csv = header + lines.join('\n');
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename="receipts.csv"');
-    res.send(csv);
-  });
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader(
+        'Content-Disposition',
+        'attachment; filename="receipts.csv"'
+      );
+      res.send(csv);
+    }
+  );
 });
 
 const PDFDocument = require('pdfkit');
 
 app.get('/api/report/monthly', authenticateToken, (req, res) => {
+  // Lock monthly PDF for Pro users
+  if (requirePro(req, res)) return;
+
   db.all(
     `SELECT * FROM receipts WHERE user_id = ? ORDER BY date ASC`,
     [req.user.id],
@@ -942,7 +1347,10 @@ app.get('/api/report/monthly', authenticateToken, (req, res) => {
       let filename = `snap2excel_report_${Date.now()}.pdf`;
       filename = encodeURIComponent(filename);
 
-      res.setHeader('Content-disposition', 'attachment; filename="' + filename + '"');
+      res.setHeader(
+        'Content-disposition',
+        'attachment; filename="' + filename + '"'
+      );
       res.setHeader('Content-type', 'application/pdf');
 
       doc.fontSize(20).text('Snap2Excel Monthly Report', { underline: true });
@@ -960,9 +1368,11 @@ app.get('/api/report/monthly', authenticateToken, (req, res) => {
       doc.moveDown();
 
       rows.forEach(r => {
-        doc.fontSize(12).text(
-          `${r.date || 'No date'} — ${r.shop} — £${r.total || 0} (VAT £${r.vat || 0})`
-        );
+        doc
+          .fontSize(12)
+          .text(
+            `${r.date || 'No date'} — ${r.shop} — £${r.total || 0} (VAT £${r.vat || 0})`
+          );
       });
 
       doc.pipe(res);
@@ -971,12 +1381,19 @@ app.get('/api/report/monthly', authenticateToken, (req, res) => {
   );
 });
 
+
 // ---- Profile routes ----
 
 app.get('/api/profile', authenticateToken, (req, res) => {
   const {
     id,
     email,
+    full_name,
+    account_type,
+    business_name,
+    country,
+    city,
+    role,
     plan_type,
     billing_info,
     profile_photo,
@@ -984,12 +1401,18 @@ app.get('/api/profile', authenticateToken, (req, res) => {
     job_title,
     weekly_price,
     credits,
-    subscription_status
+    subscription_status,
   } = req.user;
 
   res.json({
     id,
     email,
+    full_name,
+    account_type,
+    business_name,
+    country,
+    city,
+    role,
     plan_type,
     billing_info,
     profile_photo,
@@ -999,6 +1422,59 @@ app.get('/api/profile', authenticateToken, (req, res) => {
     credits,
     subscription_status,
   });
+});
+
+
+console.log('Registering /api/profile/details route');
+
+app.post('/api/profile/details', authenticateToken, (req, res) => {
+  const {
+    full_name,
+    account_type,
+    business_name,
+    country,
+    city,
+    role,
+  } = req.body;
+
+  const safeAccountType =
+    account_type === 'business' ? 'business' : 'personal';
+
+  db.run(
+    `UPDATE users
+     SET full_name = ?,
+         account_type = ?,
+         business_name = ?,
+         country = ?,
+         city = ?,
+         role = ?
+     WHERE id = ?`,
+    [
+      full_name || null,
+      safeAccountType,
+      safeAccountType === 'business' ? business_name || null : null,
+      country || null,
+      city || null,
+      role || null,
+      req.user.id,
+    ],
+    function (err) {
+      if (err) {
+        console.error('Update profile details error:', err);
+        return res.status(500).json({ error: 'DB error' });
+      }
+
+      return res.json({
+        full_name: full_name || null,
+        account_type: safeAccountType,
+        business_name:
+          safeAccountType === 'business' ? business_name || null : null,
+        country: country || null,
+        city: city || null,
+        role: role || null,
+      });
+    }
+  );
 });
 
 // Change email
@@ -1141,25 +1617,196 @@ app.post('/api/profile/job', authenticateToken, (req, res) => {
   );
 });
 
-// Create Stripe Checkout session for Pro £0.99/week
+// Get personal finance settings
+app.get('/api/money/settings', authenticateToken, (req, res) => {
+  if (req.user.account_type !== 'personal') {
+    return res.status(403).json({ error: 'Money planner is for personal accounts only.' });
+  }
+
+  db.get(
+    `SELECT income_amount, income_frequency, bills_json
+     FROM user_finance
+     WHERE user_id = ?`,
+    [req.user.id],
+    (err, row) => {
+      if (err) {
+        console.error('Money settings DB error:', err);
+        return res.status(500).json({ error: 'DB error' });
+      }
+
+      if (!row) {
+        return res.json({
+          income_amount: null,
+          income_frequency: 'monthly',
+          bills: [],
+        });
+      }
+
+      let bills = [];
+      if (row.bills_json) {
+        try {
+          bills = JSON.parse(row.bills_json);
+        } catch (_) {
+          bills = [];
+        }
+      }
+
+      res.json({
+        income_amount: row.income_amount,
+        income_frequency: row.income_frequency || 'monthly',
+        bills,
+      });
+    }
+  );
+});
+
+// Save personal finance settings
+app.post('/api/money/settings', authenticateToken, (req, res) => {
+  if (req.user.account_type !== 'personal') {
+    return res.status(403).json({ error: 'Money planner is for personal accounts only.' });
+  }
+
+  const { income_amount, income_frequency, bills } = req.body;
+
+  const safeIncome = typeof income_amount === 'number' ? income_amount : null;
+  const safeFreq =
+    income_frequency === 'weekly' || income_frequency === 'monthly'
+      ? income_frequency
+      : 'monthly';
+
+  let billsJson = null;
+  try {
+    billsJson = JSON.stringify(Array.isArray(bills) ? bills : []);
+  } catch (e) {
+    billsJson = '[]';
+  }
+
+  db.run(
+    `
+    INSERT INTO user_finance (user_id, income_amount, income_frequency, bills_json)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      income_amount = excluded.income_amount,
+      income_frequency = excluded.income_frequency,
+      bills_json = excluded.bills_json
+    `,
+    [req.user.id, safeIncome, safeFreq, billsJson],
+    function (err) {
+      if (err) {
+        console.error('Money settings save error:', err);
+        return res.status(500).json({ error: 'DB error' });
+      }
+      res.json({ success: true });
+    }
+  );
+});
+
+// Simple money plan summary (income vs bills + 50/30/20 rule)
+// Personal accounts only
+app.get('/api/money/plan', authenticateToken, (req, res) => {
+  if (req.user.account_type !== 'personal') {
+    return res.status(403).json({ error: 'Money planner is for personal accounts only.' });
+  }
+
+  db.get(
+    `SELECT income_amount, income_frequency, bills_json
+     FROM user_finance
+     WHERE user_id = ?`,
+    [req.user.id],
+    (err, row) => {
+      if (err) {
+        console.error('Money plan DB error:', err);
+        return res.status(500).json({ error: 'DB error' });
+      }
+
+      // If user hasn't set anything yet
+      if (!row || !row.income_amount) {
+        return res.json({ hasData: false });
+      }
+
+      const income = row.income_amount;
+      const freq = row.income_frequency || 'monthly';
+
+      // Normalize income to monthly
+      const monthlyIncome = freq === 'weekly' ? (income * 52) / 12 : income;
+
+      let bills = [];
+      try {
+        bills = row.bills_json ? JSON.parse(row.bills_json) : [];
+      } catch (_) {
+        bills = [];
+      }
+
+      // Each bill: { name, amount, frequency: 'weekly'|'monthly'|'yearly' }
+      let monthlyBills = 0;
+      bills.forEach((b) => {
+        const amt = Number(b.amount) || 0;
+        const f = b.frequency || 'monthly';
+
+        if (f === 'monthly') {
+          monthlyBills += amt;
+        } else if (f === 'weekly') {
+          monthlyBills += (amt * 52) / 12;
+        } else if (f === 'yearly') {
+          monthlyBills += amt / 12;
+        }
+      });
+
+      const leftover = monthlyIncome - monthlyBills;
+      const billsRatio = monthlyIncome > 0 ? monthlyBills / monthlyIncome : 0;
+
+      // 50/30/20 rule (based on monthly income)
+      const needsBudget = monthlyIncome * 0.5;
+      const wantsBudget = monthlyIncome * 0.3;
+      const savingsBudget = monthlyIncome * 0.2;
+
+      // Recommended weekly investing from the 20% pot
+      const weeklyInvest = savingsBudget / 4.33; // approx weeks per month
+
+      // Are current bills above the "needs" budget?
+      const needsOverBudget = monthlyBills > needsBudget;
+
+      res.json({
+        hasData: true,
+        monthlyIncome,
+        monthlyBills,
+        leftover,
+        billsRatio,
+        needsBudget,
+        wantsBudget,
+        savingsBudget,
+        weeklyInvest,
+        needsOverBudget,
+      });
+    }
+  );
+});
+
 app.post('/api/billing/create-checkout-session', authenticateToken, async (req, res) => {
   try {
-    const priceId = process.env.STRIPE_PRICE_ID;
-    const clientBase = process.env.CLIENT_BASE_URL || 'http://localhost:3000';
+    const { plan_type } = req.body; // 'pw_099', 'pm_299', 'bw_149', 'bm_349'
+
+    const priceMap = {
+      pw_099: process.env.STRIPE_PRICE_PW_099,
+      pm_299: process.env.STRIPE_PRICE_PM_299,
+      bw_149: process.env.STRIPE_PRICE_BW_149,
+      bm_349: process.env.STRIPE_PRICE_BM_349,
+    };
+
+    const priceId = priceMap[plan_type];
 
     if (!priceId) {
-      return res.status(500).json({ error: 'Stripe price ID not configured' });
+      return res.status(400).json({ error: 'Invalid plan type' });
     }
+
+    const clientBase = process.env.CLIENT_BASE_URL || 'http://localhost:3000';
 
     let customerId = req.user.stripe_customer_id || null;
 
-    // Create customer once, reuse later
     if (!customerId) {
       const customer = await stripe.customers.create({
         email: req.user.email,
-        metadata: {
-          user_id: String(req.user.id),
-        },
+        metadata: { user_id: String(req.user.id) },
       });
 
       customerId = customer.id;
@@ -1177,14 +1824,10 @@ app.post('/api/billing/create-checkout-session', authenticateToken, async (req, 
       mode: 'subscription',
       payment_method_types: ['card'],
       customer: customerId,
-      line_items: [
-        {
-          price: priceId,
-          quantity: 1,
-        },
-      ],
+      line_items: [{ price: priceId, quantity: 1 }],
       metadata: {
         user_id: String(req.user.id),
+        plan_type,
       },
       success_url: `${clientBase}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${clientBase}/profile?canceled=1`,
