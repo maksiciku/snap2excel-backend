@@ -1840,7 +1840,8 @@ app.post('/api/billing/create-checkout-session', authenticateToken, async (req, 
   }
 });
 
-const PORT = 5001;
+const PORT = process.env.PORT || 5001;   // 👈 use Render port in prod, 5001 locally
 app.listen(PORT, () => {
-  console.log(`Snap2Excel backend running on http://localhost:${PORT}`);
+  console.log(`Snap2Excel backend running on port ${PORT}`);
 });
+
