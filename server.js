@@ -17,6 +17,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static('profile_uploads'));
+// Expose original receipt photos
+app.use('/receipt-images', express.static('uploads'));
 
 const db = new sqlite3.Database('./receipts.db');
 
@@ -132,6 +134,12 @@ db.run(`ALTER TABLE users ADD COLUMN role TEXT`, (err) => {
   }
 });
 
+db.run(`ALTER TABLE users ADD COLUMN usage_mode TEXT DEFAULT 'personal_budget'`, (err) => {
+  if (err && !String(err.message).includes('duplicate column')) {
+    console.error('Error adding usage_mode column:', err.message);
+  }
+});
+
 // Create receipts table (if not exists)
 db.run(`
   CREATE TABLE IF NOT EXISTS receipts (
@@ -141,9 +149,13 @@ db.run(`
     total REAL,
     vat REAL,
     raw_text TEXT,
-    user_id INTEGER
+    user_id INTEGER,
+    category TEXT,
+    enhanced INTEGER DEFAULT 0,
+    image_path TEXT          -- 👈 NEW: filename of the original photo
   )
 `);
+
 
 // Ensure user_id column exists on receipts (SQLite will ignore if it already exists and we catch the error)
 db.run(`ALTER TABLE receipts ADD COLUMN user_id INTEGER`, (err) => {
@@ -159,6 +171,13 @@ db.run(`ALTER TABLE receipts ADD COLUMN category TEXT`, (err) => {
 });
 
 db.run(`ALTER TABLE receipts ADD COLUMN enhanced INTEGER DEFAULT 0`, () => {});
+
+db.run(`ALTER TABLE receipts ADD COLUMN image_path TEXT`, (err) => {
+  if (err && !String(err.message).includes('duplicate column')) {
+    console.error('Error adding image_path column:', err.message);
+  }
+});
+
 
 // Personal finance settings (one row per user)
 db.run(`
@@ -460,7 +479,7 @@ function requirePro(req, res) {
 
 // Register new user
 app.post('/api/register', async (req, res) => {
-  try {
+   try {
     const {
       full_name,
       email,
@@ -470,10 +489,32 @@ app.post('/api/register', async (req, res) => {
       country,
       city,
       role,
+      usage_mode,
     } = req.body;
 
     if (!full_name || !email || !password || !account_type) {
       return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+        // decide safe account_type + usage_mode
+    // we only trust specific values from frontend
+    let safeAccountType;
+    let safeUsageMode;
+
+    if (account_type === 'business') {
+      // business owner account (future multi-user)
+      safeAccountType = 'business';
+      safeUsageMode = 'business_owner';
+    } else {
+      // default: personal profile
+      safeAccountType = 'personal';
+
+      if (usage_mode === 'self_employed') {
+        safeUsageMode = 'self_employed';
+      } else {
+        // student / personal budgeting
+        safeUsageMode = 'personal_budget';
+      }
     }
 
     // Check if user exists
@@ -491,22 +532,25 @@ app.post('/api/register', async (req, res) => {
 
       db.run(
         `
-        INSERT INTO users
-          (full_name, email, password_hash, account_type, business_name, country, city, role, plan_type, is_admin)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO users
+          (full_name, email, password_hash, account_type, business_name, country, city, role, plan_type, is_admin, usage_mode)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
         `,
-        [
+                [
           full_name,
           email,
           hash,
-          account_type,
+          safeAccountType,
           business_name || null,
           country || null,
           city || null,
           role || null,
           'free',  // default plan for now
           0,       // not admin
+          safeUsageMode,
         ],
+
         function (err2) {
           if (err2) {
             console.error(err2);
@@ -578,7 +622,7 @@ function authenticateToken(req, res, next) {
 
     // payload = { id, email }
 db.get(
-  `SELECT
+    `SELECT
      id,
      email,
      full_name,
@@ -597,9 +641,11 @@ db.get(
      stripe_subscription_id,
      banned,
      credits,
-     subscription_status
+     subscription_status,
+     usage_mode
    FROM users
    WHERE id = ?`,
+
   [payload.id],
   (dbErr, row) => {
 
@@ -1012,6 +1058,7 @@ app.post('/api/scan-receipt',
     const filePath = req.file.path;
     const mime = req.file.mimetype;
     const ext = path.extname(req.file.originalname || '').toLowerCase();
+    const imageFileName = path.basename(filePath); // now filePath exists ✅
 
     const FREE_RECEIPT_LIMIT = 50;
     
@@ -1077,6 +1124,38 @@ app.post('/api/scan-receipt',
 
             const receiptId = this.lastID;
 
+            // --- Save original image for later viewing ---
+            const userDir = path.join('uploads', 'receipts', String(req.user.id));
+            const imageExt = ext || '.jpg';
+            const relativeImagePath = path.join(
+              'receipts',
+              String(req.user.id),
+              `${receiptId}${imageExt}`
+            );
+            const absoluteImagePath = path.join('uploads', relativeImagePath);
+
+            fs.mkdir(userDir, { recursive: true }, (mkErr) => {
+              if (mkErr) {
+                console.error('Failed to create user receipts dir:', mkErr);
+              } else {
+                fs.copyFile(filePath, absoluteImagePath, (cpErr) => {
+                  if (cpErr) {
+                    console.error('Failed to copy receipt image:', cpErr);
+                  } else {
+                    db.run(
+                      `UPDATE receipts SET image_path = ? WHERE id = ?`,
+                      [relativeImagePath, receiptId],
+                      (upErr) => {
+                        if (upErr) {
+                          console.error('Failed to save image_path:', upErr);
+                        }
+                      }
+                    );
+                  }
+                });
+              }
+            });
+
             // === Immediate response to user ===
             res.json({
               id: receiptId,
@@ -1087,13 +1166,13 @@ app.post('/api/scan-receipt',
 
             // === Background Enhanced Scan ===
             setTimeout(() => {
-              runEnhancedScan(receiptId, filePath).catch(err =>
-                console.error("Enhanced scan failed:", err)
+              runEnhancedScan(receiptId, filePath).catch((err) =>
+                console.error('Enhanced scan failed:', err)
               );
             }, 200);
-
           }
         );
+
 
       } catch (err) {
         console.error('scan-receipt error:', err);
@@ -1385,7 +1464,7 @@ app.get('/api/report/monthly', authenticateToken, (req, res) => {
 // ---- Profile routes ----
 
 app.get('/api/profile', authenticateToken, (req, res) => {
-  const {
+    const {
     id,
     email,
     full_name,
@@ -1402,6 +1481,7 @@ app.get('/api/profile', authenticateToken, (req, res) => {
     weekly_price,
     credits,
     subscription_status,
+    usage_mode,
   } = req.user;
 
   res.json({
@@ -1421,6 +1501,8 @@ app.get('/api/profile', authenticateToken, (req, res) => {
     weekly_price,
     credits,
     subscription_status,
+     usage_mode,
+
   });
 });
 
@@ -1428,17 +1510,27 @@ app.get('/api/profile', authenticateToken, (req, res) => {
 console.log('Registering /api/profile/details route');
 
 app.post('/api/profile/details', authenticateToken, (req, res) => {
-  const {
+    const {
     full_name,
     account_type,
     business_name,
     country,
     city,
     role,
+    usage_mode,
   } = req.body;
 
-  const safeAccountType =
+   const safeAccountType =
     account_type === 'business' ? 'business' : 'personal';
+
+  let safeUsageMode;
+  if (safeAccountType === 'business') {
+    safeUsageMode = 'business_owner';
+  } else if (usage_mode === 'self_employed') {
+    safeUsageMode = 'self_employed';
+  } else {
+    safeUsageMode = 'personal_budget';
+  }
 
   db.run(
     `UPDATE users
@@ -1447,7 +1539,8 @@ app.post('/api/profile/details', authenticateToken, (req, res) => {
          business_name = ?,
          country = ?,
          city = ?,
-         role = ?
+         role = ?,
+         usage_mode = ?
      WHERE id = ?`,
     [
       full_name || null,
@@ -1456,6 +1549,7 @@ app.post('/api/profile/details', authenticateToken, (req, res) => {
       country || null,
       city || null,
       role || null,
+      safeUsageMode,
       req.user.id,
     ],
     function (err) {
@@ -1837,6 +1931,42 @@ app.post('/api/billing/create-checkout-session', authenticateToken, async (req, 
   } catch (err) {
     console.error('Stripe checkout session error:', err);
     res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+app.post('/api/receipts/manual', authenticateToken, async (req, res) => {
+  try {
+    const { shop, date, total, vat, category } = req.body;
+
+    if (!shop || total == null) {
+      return res.status(400).json({ error: 'Shop and total are required' });
+    }
+
+    const userId = req.user.id;
+
+    db.run(
+      `INSERT INTO receipts (user_id, shop, date, total, vat, category, raw_text, enhanced, image_path)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)`,
+      [
+        userId,
+        shop,
+        date || null,
+        total,
+        vat || 0,
+        category || 'Other',
+        null, // raw_text (no OCR for manual entries)
+      ],
+      function (err) {
+        if (err) {
+          console.error('Manual receipt insert error:', err);
+          return res.status(500).json({ error: 'DB error' });
+        }
+        res.json({ success: true, id: this.lastID });
+      }
+    );
+  } catch (err) {
+    console.error('Manual receipt insert error', err);
+    res.status(500).json({ error: 'Failed to save receipt' });
   }
 });
 
