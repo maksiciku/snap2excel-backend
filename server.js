@@ -10,15 +10,89 @@ const jwt = require('jsonwebtoken');
 const path = require('path');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const sharp = require('sharp');
+// RAW body parser for Stripe
+const bodyParser = require('body-parser');
 
 const JWT_SECRET = 'super-secret-snap2excel-key-change-later'; // later we move to env var
 
 const app = express();
 app.use(cors());
+
+app.use(cors({
+  origin: [ 'https://snap2excel.com', 'http://localhost:3000' ],
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  credentials: true,
+}));
+
+// Stripe webhook MUST be before express.json
+app.post(
+  '/api/stripe/webhook',
+  bodyParser.raw({ type: 'application/json' }),
+  (req, res) => {
+    const sig = req.headers['stripe-signature'];
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error('Webhook signature verify failed:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        const userId = Number(session.metadata?.user_id || 0);
+        const planType = session.metadata?.plan_type || 'free';
+
+        if (userId) {
+          db.run(
+            `UPDATE users
+             SET plan_type = ?,
+                 subscription_status = 'active'
+             WHERE id = ?`,
+            [planType, userId],
+            (err) => {
+              if (err) console.error('Webhook plan update error:', err);
+            }
+          );
+        }
+        break;
+      }
+
+      case 'customer.subscription.updated':
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        const customerId = sub.customer;
+
+        db.run(
+          `UPDATE users
+           SET subscription_status = ?,
+               stripe_subscription_id = ?
+           WHERE stripe_customer_id = ?`,
+          [sub.status, sub.id, customerId],
+          (err) => {
+            if (err) console.error('Webhook sub update error:', err);
+          }
+        );
+        break;
+      }
+    }
+
+    res.json({ received: true });
+  }
+);
+
 app.use(express.json());
-app.use('/uploads', express.static('profile_uploads'));
-// Expose original receipt photos
-app.use('/receipt-images', express.static('uploads'));
+// Profile avatars
+app.use('/profile-uploads', express.static('profile_uploads'));
+
+// Receipt images
+app.use('/uploads', express.static('uploads'));
 
 const db = new sqlite3.Database('./receipts.db');
 
@@ -156,28 +230,17 @@ db.run(`
   )
 `);
 
-
-// Ensure user_id column exists on receipts (SQLite will ignore if it already exists and we catch the error)
-db.run(`ALTER TABLE receipts ADD COLUMN user_id INTEGER`, (err) => {
+db.run(`ALTER TABLE users ADD COLUMN date_of_birth TEXT`, (err) => {
   if (err && !String(err.message).includes('duplicate column')) {
-    console.error('Error adding user_id column:', err.message);
+    console.error('Error adding date_of_birth column:', err.message);
   }
 });
 
-db.run(`ALTER TABLE receipts ADD COLUMN category TEXT`, (err) => {
+db.run(`ALTER TABLE users ADD COLUMN experience_mode TEXT DEFAULT 'adult'`, (err) => {
   if (err && !String(err.message).includes('duplicate column')) {
-    console.error('Error adding category column:', err.message);
+    console.error('Error adding experience_mode column:', err.message);
   }
 });
-
-db.run(`ALTER TABLE receipts ADD COLUMN enhanced INTEGER DEFAULT 0`, () => {});
-
-db.run(`ALTER TABLE receipts ADD COLUMN image_path TEXT`, (err) => {
-  if (err && !String(err.message).includes('duplicate column')) {
-    console.error('Error adding image_path column:', err.message);
-  }
-});
-
 
 // Personal finance settings (one row per user)
 db.run(`
@@ -490,6 +553,7 @@ app.post('/api/register', async (req, res) => {
       city,
       role,
       usage_mode,
+      date_of_birth,
     } = req.body;
 
     if (!full_name || !email || !password || !account_type) {
@@ -517,6 +581,16 @@ app.post('/api/register', async (req, res) => {
       }
     }
 
+    // --- AUTO EXPERIENCE MODE ---
+// calculate age from DOB
+let experience_mode = 'adult';
+if (date_of_birth) {
+  const year = parseInt(date_of_birth.split('-')[0]);
+  const currentYear = new Date().getFullYear();
+  const age = currentYear - year;
+  if (age <= 25) experience_mode = 'youth';
+}
+
     // Check if user exists
     db.get('SELECT id FROM users WHERE email = ?', [email], async (err, row) => {
       if (err) {
@@ -530,43 +604,53 @@ app.post('/api/register', async (req, res) => {
       const saltRounds = 10;
       const hash = await bcrypt.hash(password, saltRounds);
 
-      db.run(
-        `
-                INSERT INTO users
-          (full_name, email, password_hash, account_type, business_name, country, city, role, plan_type, is_admin, usage_mode)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      // inside your /api/register route, where you currently have db.run(...)
+db.run(
+  `INSERT INTO users
+    (full_name,
+     email,
+     password_hash,
+     account_type,
+     business_name,
+     country,
+     city,
+     role,
+     plan_type,
+     is_admin,
+     usage_mode,
+     date_of_birth,
+     experience_mode)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  [
+    full_name,
+    email,
+    hash,
+    safeAccountType,
+    business_name || null,
+    country || null,
+    city || null,
+    role || null,
+    'free', // plan_type
+    0, // is_admin
+    safeUsageMode,
+    date_of_birth || null,
+    experience_mode
+  ],
+  function (err2) {
+    if (err2) {
+      console.error('REGISTER INSERT ERROR:', err2);
+      return res.status(500).json({ error: 'Failed to create user', detail: err2.message });
+    }
 
-        `,
-                [
-          full_name,
-          email,
-          hash,
-          safeAccountType,
-          business_name || null,
-          country || null,
-          city || null,
-          role || null,
-          'free',  // default plan for now
-          0,       // not admin
-          safeUsageMode,
-        ],
+    const userId = this.lastID;
+    // return both token and user id for frontend verification
+    const token = jwt.sign({ id: userId }, JWT_SECRET, { expiresIn: '7d' });
 
-        function (err2) {
-          if (err2) {
-            console.error(err2);
-            return res.status(500).json({ error: 'Failed to create user' });
-          }
+    console.log(`New user created: id=${userId} email=${email}`);
+    return res.json({ token, userId });
+  }
+);
 
-          // You can auto-login here and return token, like before
-          const userId = this.lastID;
-          const token = jwt.sign({ id: userId }, JWT_SECRET, {
-  expiresIn: '7d',
-});
-
-
-          res.json({ token });
-        }
-      );
     });
   } catch (e) {
     console.error(e);
@@ -599,7 +683,14 @@ app.post('/api/login', (req, res) => {
     const user = { id: row.id, email: row.email };
     const token = jwt.sign(user, JWT_SECRET, { expiresIn: '7d' });
 
-    res.json({ token, user });
+res.json({
+  token,
+  user: {
+    id: row.id,
+    email: row.email,
+    experience_mode: row.experience_mode
+  }
+});
   });
 });
 
@@ -642,7 +733,9 @@ db.get(
      banned,
      credits,
      subscription_status,
-     usage_mode
+     usage_mode,
+     date_of_birth,
+     experience_mode
    FROM users
    WHERE id = ?`,
 
@@ -1464,7 +1557,7 @@ app.get('/api/report/monthly', authenticateToken, (req, res) => {
 // ---- Profile routes ----
 
 app.get('/api/profile', authenticateToken, (req, res) => {
-    const {
+  const {
     id,
     email,
     full_name,
@@ -1482,6 +1575,8 @@ app.get('/api/profile', authenticateToken, (req, res) => {
     credits,
     subscription_status,
     usage_mode,
+    date_of_birth,
+    experience_mode,
   } = req.user;
 
   res.json({
@@ -1501,8 +1596,11 @@ app.get('/api/profile', authenticateToken, (req, res) => {
     weekly_price,
     credits,
     subscription_status,
-     usage_mode,
-
+    usage_mode,
+    date_of_birth,
+    experience_mode,
+    is_youth: experience_mode === 'youth',
+    is_business: account_type === 'business',
   });
 });
 
@@ -1510,7 +1608,7 @@ app.get('/api/profile', authenticateToken, (req, res) => {
 console.log('Registering /api/profile/details route');
 
 app.post('/api/profile/details', authenticateToken, (req, res) => {
-    const {
+  const {
     full_name,
     account_type,
     business_name,
@@ -1518,11 +1616,14 @@ app.post('/api/profile/details', authenticateToken, (req, res) => {
     city,
     role,
     usage_mode,
+    date_of_birth,
   } = req.body;
 
-   const safeAccountType =
+  // Validate account type
+  const safeAccountType =
     account_type === 'business' ? 'business' : 'personal';
 
+  // Determine safe usage mode
   let safeUsageMode;
   if (safeAccountType === 'business') {
     safeUsageMode = 'business_owner';
@@ -1530,6 +1631,15 @@ app.post('/api/profile/details', authenticateToken, (req, res) => {
     safeUsageMode = 'self_employed';
   } else {
     safeUsageMode = 'personal_budget';
+  }
+
+  // AUTO youth/adult mode
+  let nextMode = req.user.experience_mode;
+
+  if (date_of_birth) {
+    const y = parseInt(date_of_birth.split('-')[0]);
+    const age = new Date().getFullYear() - y;
+    nextMode = age <= 25 ? 'youth' : 'adult';
   }
 
   db.run(
@@ -1540,7 +1650,9 @@ app.post('/api/profile/details', authenticateToken, (req, res) => {
          country = ?,
          city = ?,
          role = ?,
-         usage_mode = ?
+         usage_mode = ?,
+         date_of_birth = ?,
+         experience_mode = ?
      WHERE id = ?`,
     [
       full_name || null,
@@ -1550,6 +1662,8 @@ app.post('/api/profile/details', authenticateToken, (req, res) => {
       city || null,
       role || null,
       safeUsageMode,
+      date_of_birth || req.user.date_of_birth || null,
+      nextMode,
       req.user.id,
     ],
     function (err) {
@@ -1566,10 +1680,13 @@ app.post('/api/profile/details', authenticateToken, (req, res) => {
         country: country || null,
         city: city || null,
         role: role || null,
+        date_of_birth: date_of_birth || req.user.date_of_birth || null,
+        experience_mode: nextMode,
       });
     }
   );
 });
+
 
 // Change email
 app.post('/api/profile/email', authenticateToken, (req, res) => {
@@ -1692,21 +1809,21 @@ app.delete('/api/profile', authenticateToken, (req, res) => {
   });
 });
 
-// Update job title and plan type
+// Update job title ONLY (no plan_type change here)
 app.post('/api/profile/job', authenticateToken, (req, res) => {
-  const { job_title, plan_type } = req.body;
+  const { job_title } = req.body;
 
   db.run(
     `UPDATE users
-     SET job_title = ?, plan_type = ?
+     SET job_title = ?
      WHERE id = ?`,
-    [job_title || null, plan_type || 'free', req.user.id],
+    [job_title || null, req.user.id],
     function (err) {
       if (err) {
         console.error('Update job error:', err);
         return res.status(500).json({ error: 'DB error' });
       }
-      res.json({ success: true, job_title, plan_type });
+      res.json({ success: true, job_title });
     }
   );
 });
