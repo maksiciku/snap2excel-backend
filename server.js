@@ -14,6 +14,10 @@ const sharp = require('sharp');
 const bodyParser = require('body-parser');
 
 const JWT_SECRET = 'super-secret-snap2excel-key-change-later'; // later we move to env var
+const TINK_CLIENT_ID = process.env.TINK_CLIENT_ID;
+const TINK_CLIENT_SECRET = process.env.TINK_CLIENT_SECRET;
+
+const TINK_REDIRECT_URI = process.env.TINK_REDIRECT_URI;
 
 const app = express();
 app.use(cors());
@@ -759,73 +763,88 @@ db.get(
   });
 }
 
-function requireAdmin(req, res, next) {
-  if (!req.user || !req.user.is_admin) {
-    return res.status(403).json({ error: 'Admin only' });
-  }
-  next();
-}
-
 // ---- ADMIN ROUTES ----
-
-// Overall summary for admin dashboard
+// High-level product/ revenue summary for admin
 app.get('/api/admin/summary', authenticateToken, requireAdmin, (req, res) => {
-  const summary = {};
+  // First: user counts (total, pro, free)
+  const userSql = `
+    SELECT
+      COUNT(*) AS total_users,
+      SUM(CASE WHEN plan_type IS NOT NULL AND plan_type != 'free' THEN 1 ELSE 0 END) AS pro_users
+    FROM users
+  `;
 
-  // Total users
-  db.get(`SELECT COUNT(*) AS total_users FROM users`, [], (err, row) => {
-    if (err) return res.status(500).json({ error: 'DB error' });
-    summary.total_users = row.total_users;
+  db.get(userSql, [], (err, userRow) => {
+    if (err) {
+      console.error('Admin summary user error:', err);
+      return res.status(500).json({ error: 'DB error' });
+    }
 
-    // Pro users + weekly MRR estimate
-    db.get(
-      `SELECT
-         COUNT(*) AS pro_users,
-         IFNULL(SUM(weekly_price), 0) AS weekly_mrr
-       FROM users
-       WHERE plan_type LIKE 'weekly_%'`,
-      [],
-      (err2, row2) => {
-        if (err2) return res.status(500).json({ error: 'DB error' });
+    const totalUsers = userRow?.total_users || 0;
+    const proUsers = userRow?.pro_users || 0;
+    const freeUsers = totalUsers - proUsers;
 
-        summary.pro_users = row2.pro_users;
-        summary.weekly_mrr = row2.weekly_mrr;
+    // Second: receipts summary
+    const receiptsSql = `
+      SELECT
+        COUNT(*) AS total_receipts,
+        COALESCE(SUM(total), 0) AS total_spend
+      FROM receipts
+    `;
 
-        // Receipts + total spend
-        db.get(
-          `SELECT COUNT(*) AS total_receipts, IFNULL(SUM(total),0) AS total_spend
-           FROM receipts`,
-          [],
-          (err3, row3) => {
-            if (err3) return res.status(500).json({ error: 'DB error' });
-
-            summary.total_receipts = row3.total_receipts;
-            summary.total_spend = row3.total_spend;
-
-            res.json(summary);
-          }
-        );
+    db.get(receiptsSql, [], (err2, recRow) => {
+      if (err2) {
+        console.error('Admin summary receipts error:', err2);
+        return res.status(500).json({ error: 'DB error' });
       }
-    );
+
+      const totalReceipts = recRow?.total_receipts || 0;
+      const totalSpend = recRow?.total_spend || 0;
+
+      // Third: estimated weekly MRR (sum of weekly_price for non-free plans)
+      const mrrSql = `
+        SELECT COALESCE(SUM(weekly_price), 0) AS weekly_mrr
+        FROM users
+        WHERE plan_type IS NOT NULL
+          AND plan_type != 'free'
+      `;
+
+      db.get(mrrSql, [], (err3, mrrRow) => {
+        if (err3) {
+          console.error('Admin summary MRR error:', err3);
+          return res.status(500).json({ error: 'DB error' });
+        }
+
+        res.json({
+          total_users: totalUsers,
+          pro_users: proUsers,
+          free_users: freeUsers,
+          total_receipts: totalReceipts,
+          total_spend: totalSpend,
+          weekly_mrr: mrrRow?.weekly_mrr || 0,
+        });
+      });
+    });
   });
 });
 
-
-// List all users with receipt counts and spend
+// List users + their receipts & total spend
 app.get('/api/admin/users', authenticateToken, requireAdmin, (req, res) => {
   const sql = `
     SELECT
       u.id,
       u.email,
       u.plan_type,
-      u.is_admin,
-      u.banned,
       u.credits,
       u.subscription_status,
+      u.is_admin,
+      u.banned,
+      u.weekly_price,
       COUNT(r.id) AS receipt_count,
-      IFNULL(SUM(r.total), 0) AS total_spend
+      COALESCE(SUM(r.total), 0) AS total_spend
     FROM users u
-    LEFT JOIN receipts r ON r.user_id = u.id
+    LEFT JOIN receipts r
+      ON r.user_id = u.id
     GROUP BY u.id
     ORDER BY u.id ASC
   `;
@@ -835,7 +854,7 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, (req, res) => {
       console.error('Admin users error:', err);
       return res.status(500).json({ error: 'DB error' });
     }
-    res.json(rows);
+    res.json(rows || []);
   });
 });
 
@@ -2086,6 +2105,372 @@ app.post('/api/receipts/manual', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to save receipt' });
   }
 });
+
+// Simple admin guard – adjust if you already have a middleware
+function requireAdmin(req, res, next) {
+  if (!req.user || !req.user.is_admin) {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  next();
+}
+
+// Simple user stats for the extra "Total / Pro / Free" cards
+app.get('/api/admin/user-stats', authenticateToken, requireAdmin, (req, res) => {
+  const sql = `
+    SELECT
+      COUNT(*) AS total_users,
+      SUM(CASE WHEN plan_type IS NOT NULL AND plan_type != 'free' THEN 1 ELSE 0 END) AS pro_users,
+      SUM(CASE WHEN plan_type IS NULL OR plan_type = 'free' THEN 1 ELSE 0 END) AS free_users
+    FROM users
+  `;
+
+  db.get(sql, [], (err, row) => {
+    if (err) {
+      console.error('Admin user-stats error:', err);
+      return res.status(500).json({ error: 'DB error' });
+    }
+    res.json({
+      total_users: row?.total_users || 0,
+      pro_users: row?.pro_users || 0,
+      free_users: row?.free_users || 0,
+    });
+  });
+});
+
+app.get('/api/admin/7day', authenticateToken, requireAdmin, (req, res) => {
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
+  const result = {
+    new_users: 0,
+    receipts_scanned: 0,
+  };
+
+  db.get(
+    `SELECT COUNT(*) AS c FROM users WHERE created_at >= ?`,
+    [sevenDaysAgo],
+    (err, row) => {
+      if (!err) result.new_users = row.c;
+
+      db.get(
+        `SELECT COUNT(*) AS c FROM receipts WHERE timestamp >= ?`,
+        [sevenDaysAgo],
+        (err2, row2) => {
+          if (!err2) result.receipts_scanned = row2.c;
+          res.json(result);
+        }
+      );
+    }
+  );
+});
+
+app.get('/api/admin/retention', authenticateToken, requireAdmin, (req, res) => {
+  const sevenAgo = Date.now() - 7 * 86400000;
+  const thirtyAgo = Date.now() - 30 * 86400000;
+
+  const data = { ret7: 0, ret30: 0 };
+
+  db.get(
+    `SELECT COUNT(DISTINCT user_id) AS c FROM receipts WHERE timestamp >= ?`,
+    [sevenAgo],
+    (err, row) => {
+      if (!err) data.ret7 = row.c;
+
+      db.get(
+        `SELECT COUNT(DISTINCT user_id) AS c FROM receipts WHERE timestamp >= ?`,
+        [thirtyAgo],
+        (err2, row2) => {
+          if (!err2) data.ret30 = row2.c;
+          res.json(data);
+        }
+      );
+    }
+  );
+});
+
+
+const TIPS = [
+  "If it doesn't bring joy or value, skip it.",
+  "£20 saved weekly = £1040 a year.",
+  "Track your receipts — that's where profit appears.",
+  "Try buying store brands for 2 weeks and compare results.",
+  "Impulse buys vanish fast — savings stay forever.",
+  "Spent too much yesterday? Balance it today.",
+  "Your leftover is your real profit — protect it.",
+];
+
+app.get('/api/tip', authenticateToken, requireAdmin, (req, res) => {
+  const tip = TIPS[Math.floor(Math.random() * TIPS.length)];
+  res.json({ tip });
+});
+
+app.get('/api/insights/spending', authenticateToken, requireAdmin, (req, res) => {
+  db.all(
+    `SELECT shop, total FROM receipts WHERE user_id = ?`,
+    [req.user.id],
+    (err, rows) => {
+      if (err) return res.json({ error: 'DB error' });
+
+      let food = 0;
+      let amazon = 0;
+      let totalSpend = 0;
+
+      rows.forEach(r => {
+        const shop = r.shop?.toLowerCase() || "";
+        const amt = Number(r.total) || 0;
+        totalSpend += amt;
+
+        if (shop.includes('tesco') || shop.includes('sainsbury') || shop.includes('aldi'))
+          food += amt;
+
+        if (shop.includes('amazon'))
+          amazon += amt;
+      });
+
+      let insights = [];
+
+      if (food > totalSpend * 0.4) {
+        insights.push("You are spending most of your money on food this month. Try switching 1–2 meals to cheaper alternatives.");
+      }
+
+      if (amazon > 20) {
+        insights.push(`You spent £${amazon.toFixed(2)} on Amazon this month. Amazon purchases add up fast.`);
+      }
+
+      if (insights.length === 0) {
+        insights.push("Your spending looks balanced this month — nice job.");
+      }
+
+      res.json({ insights });
+    }
+  );
+});
+
+// DAU placeholder
+app.get('/api/admin/dau', authenticateToken, requireAdmin, (req, res) => {
+  res.json({
+    today: 0,
+    yesterday: 0,
+    avg_7_days: 0,
+  });
+});
+
+app.get('/api/admin/active-users', authenticateToken, requireAdmin, (req, res) => {
+  const now = Date.now();
+  const weekAgo = now - 7 * 86400000;
+  const monthAgo = now - 30 * 86400000;
+
+  const result = { wau: 0, mau: 0 };
+
+  db.get(
+    `SELECT COUNT(DISTINCT user_id) AS c FROM receipts WHERE timestamp >= ?`,
+    [weekAgo],
+    (err, r1) => {
+      if (!err) result.wau = r1.c;
+
+      db.get(
+        `SELECT COUNT(DISTINCT user_id) AS c FROM receipts WHERE timestamp >= ?`,
+        [monthAgo],
+        (err2, r2) => {
+          if (!err2) result.mau = r2.c;
+          res.json(result);
+        }
+      );
+    }
+  );
+});
+
+// 📰 Activity feed (recent receipt scans) – RETURNS AN ARRAY
+app.get('/api/admin/activity', authenticateToken, requireAdmin, (req, res) => {
+  const sql = `
+    SELECT
+      r.id,
+      r.user_id,
+      u.email,
+      r.shop,
+      r.total,
+      COALESCE(r.date, '') AS date
+    FROM receipts r
+    JOIN users u ON u.id = r.user_id
+    ORDER BY r.id DESC
+    LIMIT 50
+  `;
+  db.all(sql, [], (err, rows) => {
+    if (err) {
+      console.error('Admin activity error:', err);
+      return res.status(500).json({ error: 'DB error' });
+    }
+    res.json(rows || []);
+  });
+});
+
+// 📤 Export all users as CSV
+app.get('/api/admin/export/users', authenticateToken, requireAdmin, (req, res) => {
+  const sql = `
+    SELECT
+      id,
+      email,
+      plan_type,
+      credits,
+      subscription_status,
+      is_admin,
+      banned
+    FROM users
+    ORDER BY id ASC
+  `;
+  db.all(sql, [], (err, rows) => {
+    if (err) {
+      console.error('Admin export users error:', err);
+      return res.status(500).json({ error: 'DB error' });
+    }
+
+    const header = [
+      'id',
+      'email',
+      'plan_type',
+      'credits',
+      'subscription_status',
+      'is_admin',
+      'banned',
+    ];
+
+    const escape = (val) => {
+      if (val == null) return '';
+      const s = String(val);
+      if (s.includes('"') || s.includes(',') || s.includes('\n')) {
+        return `"${s.replace(/"/g, '""')}"`;
+      }
+      return s;
+    };
+
+    const lines = [
+      header.join(','),
+      ...rows.map((row) =>
+        header.map((h) => escape(row[h])).join(',')
+      ),
+    ];
+    const csv = lines.join('\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="users.csv"');
+    res.send(csv);
+  });
+});
+
+// 📤 Export all receipts as CSV
+app.get('/api/admin/export/receipts', authenticateToken, requireAdmin, (req, res) => {
+  const sql = `
+    SELECT
+      r.id,
+      r.user_id,
+      u.email,
+      r.shop,
+      r.date,
+      r.total,
+      r.vat,
+      r.category
+    FROM receipts r
+    JOIN users u ON u.id = r.user_id
+    ORDER BY r.id ASC
+  `;
+  db.all(sql, [], (err, rows) => {
+    if (err) {
+      console.error('Admin export receipts error:', err);
+      return res.status(500).json({ error: 'DB error' });
+    }
+
+    const header = [
+      'id',
+      'user_id',
+      'email',
+      'shop',
+      'date',
+      'total',
+      'vat',
+      'category',
+    ];
+
+    const escape = (val) => {
+      if (val == null) return '';
+      const s = String(val);
+      if (s.includes('"') || s.includes(',') || s.includes('\n')) {
+        return `"${s.replace(/"/g, '""')}"`;
+      }
+      return s;
+    };
+
+    const lines = [
+      header.join(','),
+      ...rows.map((row) =>
+        header.map((h) => escape(row[h])).join(',')
+      ),
+    ];
+    const csv = lines.join('\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="receipts.csv"'
+    );
+    res.send(csv);
+  });
+});
+
+// Start Tink Link flow – returns a URL the frontend can redirect to
+app.post('/api/tink/link', authenticateToken, (req, res) => {
+  if (!TINK_CLIENT_ID || !TINK_REDIRECT_URI) {
+    return res.status(500).json({ error: 'Tink not configured' });
+  }
+
+  const base = 'https://link.tink.com/1.0/authorize/';
+
+  const params = new URLSearchParams({
+    client_id: TINK_CLIENT_ID,
+    redirect_uri: TINK_REDIRECT_URI,
+    scope: 'accounts:read,transactions:read',
+    market: 'GB',
+    locale: 'en_GB',
+    response_type: 'code',
+  });
+
+  const linkUrl = `${base}?${params.toString()}`;
+  return res.json({ linkUrl });
+});
+
+// Start Tink Link flow (sandbox) – redirect browser to Tink
+app.get('/api/tink/start', (req, res) => {
+  if (!TINK_CLIENT_ID || !TINK_REDIRECT_URI) {
+    console.error('Tink not configured – missing env vars');
+    return res.status(500).send('Tink not configured');
+  }
+
+  const params = new URLSearchParams({
+    client_id: TINK_CLIENT_ID,
+    redirect_uri: TINK_REDIRECT_URI,      // use the env one
+    scope: 'accounts:read,transactions:read',
+    market: 'GB',
+    locale: 'en_GB',
+    response_type: 'code',
+    test: 'true',                         // IMPORTANT for sandbox
+  });
+
+  const url = `https://link.tink.com/1.0/authorize/?${params.toString()}`;
+
+  console.log('🔗 Redirecting to Tink Link:', url);
+  return res.redirect(url);
+});
+
+app.get('/api/tink/callback', async (req, res) => {
+  const { code } = req.query;
+  if (!code) {
+    return res.status(400).send('Missing code from Tink');
+  }
+
+  console.log('✅ Tink auth code received:', code);
+
+  // later: exchange code → token, fetch transactions, save them per user
+  return res.redirect('http://localhost:3000/dashboard?bank=connected');
+});
+
 
 const PORT = process.env.PORT || 5001;   // 👈 use Render port in prod, 5001 locally
 app.listen(PORT, () => {
