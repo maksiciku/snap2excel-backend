@@ -666,6 +666,36 @@ db.run(
 // Login existing user
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
+  if (
+    email === 'guest@snap2excel.com' &&
+    password === 'guest-demo'
+  ) {
+    const jwt = require('jsonwebtoken');
+    const SECRET = process.env.JWT_SECRET || 'dev-secret';
+
+    const token = jwt.sign(
+      {
+        id: -1,
+        email,
+        name: 'Guest',
+        plan: 'personal',
+        is_admin: 0,
+      },
+      SECRET,
+      { expiresIn: '7d' }
+    );
+
+    return res.json({
+      token,
+      user: {
+        id: -1,
+        email,
+        name: 'Guest',
+        plan: 'personal',
+        is_admin: 0,
+      },
+    });
+  }
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password required' });
   }
