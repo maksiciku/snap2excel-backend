@@ -2198,52 +2198,71 @@ const TIPS = [
   "Your leftover is your real profit — protect it.",
 ];
 
-app.get('/api/tip', authenticateToken, requireAdmin, (req, res) => {
+// Tip is available to all logged-in users
+app.get('/api/tip', authenticateToken, (req, res) => {
   const tip = TIPS[Math.floor(Math.random() * TIPS.length)];
   res.json({ tip });
 });
 
-app.get('/api/insights/spending', authenticateToken, requireAdmin, (req, res) => {
+// Simple spending insights per user – not admin only
+app.get('/api/insights/spending', authenticateToken, (req, res) => {
   db.all(
     `SELECT shop, total FROM receipts WHERE user_id = ?`,
     [req.user.id],
     (err, rows) => {
-      if (err) return res.json({ error: 'DB error' });
+      if (err) {
+        console.error('Insights DB error:', err);
+        return res.status(500).json({ error: 'DB error' });
+      }
 
       let food = 0;
       let amazon = 0;
       let totalSpend = 0;
 
-      rows.forEach(r => {
-        const shop = r.shop?.toLowerCase() || "";
+      rows.forEach((r) => {
+        const shop = r.shop?.toLowerCase() || '';
         const amt = Number(r.total) || 0;
         totalSpend += amt;
 
-        if (shop.includes('tesco') || shop.includes('sainsbury') || shop.includes('aldi'))
+        if (
+          shop.includes('tesco') ||
+          shop.includes('sainsbury') ||
+          shop.includes('aldi') ||
+          shop.includes('lidl')
+        ) {
           food += amt;
+        }
 
-        if (shop.includes('amazon'))
+        if (shop.includes('amazon')) {
           amazon += amt;
+        }
       });
 
-      let insights = [];
+      const insights = [];
 
-      if (food > totalSpend * 0.4) {
-        insights.push("You are spending most of your money on food this month. Try switching 1–2 meals to cheaper alternatives.");
+      if (food > totalSpend * 0.4 && totalSpend > 0) {
+        insights.push(
+          'You are spending a big chunk of your money on food. Try swapping 1–2 shops to cheaper options this month.'
+        );
       }
 
       if (amazon > 20) {
-        insights.push(`You spent £${amazon.toFixed(2)} on Amazon this month. Amazon purchases add up fast.`);
+        insights.push(
+          `You spent about £${amazon.toFixed(
+            2
+          )} on Amazon. Small orders there add up quickly.`
+        );
       }
 
       if (insights.length === 0) {
-        insights.push("Your spending looks balanced this month — nice job.");
+        insights.push('Your spending looks balanced this month – keep going like this.');
       }
 
       res.json({ insights });
     }
   );
 });
+
 
 // DAU placeholder
 app.get('/api/admin/dau', authenticateToken, requireAdmin, (req, res) => {
