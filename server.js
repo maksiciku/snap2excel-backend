@@ -672,6 +672,34 @@ app.post('/api/login', (req, res) => {
     return res.status(400).json({ error: 'Missing email or password' });
   }
 
+  // 1) DEMO GUEST ACCOUNT – for marketing
+  if (email === 'demo@snap2excel.com' && password === 'demo1234') {
+    const token = jwt.sign(
+      {
+        id: -1,
+        email,
+        full_name: 'Guest Demo',
+        plan_type: 'free',
+        is_admin: 0,
+      },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    return res.json({
+      token,
+      user: {
+        id: -1,
+        email,
+        full_name: 'Guest Demo',
+        plan_type: 'free',
+        is_admin: 0,
+      },
+    });
+  }
+
+  // 2) NORMAL USER LOGIN (DB)
+  //   – use real columns and case-insensitive email
   const sql = `
     SELECT
       id,
@@ -680,14 +708,13 @@ app.post('/api/login', (req, res) => {
       password_hash,
       plan_type,
       is_admin,
-      account_type,
       usage_mode,
       experience_mode
     FROM users
-    WHERE email = ?
+    WHERE LOWER(email) = LOWER(?)
   `;
 
-  db.get(sql, [email.toLowerCase()], (err, user) => {
+  db.get(sql, [email], (err, user) => {
     if (err) {
       console.error('DB error on login', err);
       return res.status(500).json({ error: 'Database error' });
@@ -709,9 +736,16 @@ app.post('/api/login', (req, res) => {
         return res.status(400).json({ error: 'Wrong email or password' });
       }
 
-      // ✅ IMPORTANT: use JWT_SECRET (the one you defined at the top)
       const token = jwt.sign(
-        { id: user.id },
+        {
+          id: user.id,
+          email: user.email,
+          full_name: user.full_name,
+          plan_type: user.plan_type || 'free',
+          is_admin: user.is_admin || 0,
+          usage_mode: user.usage_mode,
+          experience_mode: user.experience_mode,
+        },
         JWT_SECRET,
         { expiresIn: '7d' }
       );
@@ -722,9 +756,8 @@ app.post('/api/login', (req, res) => {
           id: user.id,
           email: user.email,
           full_name: user.full_name,
-          account_type: user.account_type,
-          plan_type: user.plan_type,
-          is_admin: user.is_admin,
+          plan_type: user.plan_type || 'free',
+          is_admin: user.is_admin || 0,
           usage_mode: user.usage_mode,
           experience_mode: user.experience_mode,
         },
