@@ -663,109 +663,40 @@ db.run(
 });
 
 
+// Login existing user
 app.post('/api/login', (req, res) => {
-  const { email, password } = req.body || {};
-
-  console.log('LOGIN attempt:', email);
-
+  const { email, password } = req.body;
   if (!email || !password) {
-    return res.status(400).json({ error: 'Missing email or password' });
+    return res.status(400).json({ error: 'Email and password required' });
   }
 
-  // 1) DEMO GUEST ACCOUNT – for marketing
-  if (email === 'demo@snap2excel.com' && password === 'demo1234') {
-    const token = jwt.sign(
-      {
-        id: -1,
-        email,
-        full_name: 'Guest Demo',
-        plan_type: 'free',
-        is_admin: 0,
-      },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    return res.json({
-      token,
-      user: {
-        id: -1,
-        email,
-        full_name: 'Guest Demo',
-        plan_type: 'free',
-        is_admin: 0,
-      },
-    });
-  }
-
-  // 2) NORMAL USER LOGIN (DB)
-  //   – use real columns and case-insensitive email
-  const sql = `
-    SELECT
-      id,
-      email,
-      full_name,
-      password_hash,
-      plan_type,
-      is_admin,
-      usage_mode,
-      experience_mode
-    FROM users
-    WHERE LOWER(email) = LOWER(?)
-  `;
-
-  db.get(sql, [email], (err, user) => {
+  db.get(`SELECT * FROM users WHERE email = ?`, [email], async (err, row) => {
     if (err) {
-      console.error('DB error on login', err);
-      return res.status(500).json({ error: 'Database error' });
+      console.error('Login DB error:', err);
+      return res.status(500).json({ error: 'DB error' });
+    }
+    if (!row) {
+      return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    if (!user) {
-      console.log('No user found for', email);
-      return res.status(400).json({ error: 'Wrong email or password' });
+    const match = await bcrypt.compare(password, row.password_hash);
+    if (!match) {
+      return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    bcrypt.compare(password, user.password_hash, (err2, same) => {
-      if (err2) {
-        console.error('bcrypt error', err2);
-        return res.status(500).json({ error: 'Password check failed' });
-      }
+    const user = { id: row.id, email: row.email };
+    const token = jwt.sign(user, JWT_SECRET, { expiresIn: '7d' });
 
-      if (!same) {
-        console.log('Bad password for', email);
-        return res.status(400).json({ error: 'Wrong email or password' });
-      }
-
-      const token = jwt.sign(
-        {
-          id: user.id,
-          email: user.email,
-          full_name: user.full_name,
-          plan_type: user.plan_type || 'free',
-          is_admin: user.is_admin || 0,
-          usage_mode: user.usage_mode,
-          experience_mode: user.experience_mode,
-        },
-        JWT_SECRET,
-        { expiresIn: '7d' }
-      );
-
-      res.json({
-        token,
-        user: {
-          id: user.id,
-          email: user.email,
-          full_name: user.full_name,
-          plan_type: user.plan_type || 'free',
-          is_admin: user.is_admin || 0,
-          usage_mode: user.usage_mode,
-          experience_mode: user.experience_mode,
-        },
-      });
-    });
+res.json({
+  token,
+  user: {
+    id: row.id,
+    email: row.email,
+    experience_mode: row.experience_mode
+  }
+});
   });
 });
-
 
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
