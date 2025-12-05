@@ -663,15 +663,21 @@ db.run(
 });
 
 
-// Login existing user
 app.post('/api/login', (req, res) => {
-  const { email, password } = req.body;
+  const { email, password } = req.body || {};
+
+  console.log('LOGIN attempt:', email); // debug
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Missing email or password' });
+  }
+
+  // 🔹 1) DEMO GUEST ACCOUNT – works even with empty DB
   if (
     email === 'guest@snap2excel.com' &&
     password === 'guest-demo'
   ) {
-    const jwt = require('jsonwebtoken');
-    const SECRET = process.env.JWT_SECRET || 'dev-secret';
+    console.log('Guest demo login OK');
 
     const token = jwt.sign(
       {
@@ -696,35 +702,56 @@ app.post('/api/login', (req, res) => {
       },
     });
   }
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password required' });
-  }
 
-  db.get(`SELECT * FROM users WHERE email = ?`, [email], async (err, row) => {
+  // 🔹 2) NORMAL USER LOGIN (DB)
+  const sql =
+    'SELECT id, email, name, password_hash, plan, is_admin FROM users WHERE email = ?';
+
+  db.get(sql, [email.toLowerCase()], (err, user) => {
     if (err) {
-      console.error('Login DB error:', err);
-      return res.status(500).json({ error: 'DB error' });
-    }
-    if (!row) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+      console.error('DB error on login', err);
+      return res.status(500).json({ error: 'Database error' });
     }
 
-    const match = await bcrypt.compare(password, row.password_hash);
-    if (!match) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+    if (!user) {
+      console.log('No user found for', email);
+      return res.status(400).json({ error: 'Wrong email or password' });
     }
 
-    const user = { id: row.id, email: row.email };
-    const token = jwt.sign(user, JWT_SECRET, { expiresIn: '7d' });
+    bcrypt.compare(password, user.password_hash, (err2, same) => {
+      if (err2) {
+        console.error('bcrypt error', err2);
+        return res.status(500).json({ error: 'Password check failed' });
+      }
 
-res.json({
-  token,
-  user: {
-    id: row.id,
-    email: row.email,
-    experience_mode: row.experience_mode
-  }
-});
+      if (!same) {
+        console.log('Bad password for', email);
+        return res.status(400).json({ error: 'Wrong email or password' });
+      }
+
+      const token = jwt.sign(
+        {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          plan: user.plan || 'personal',
+          is_admin: user.is_admin || 0,
+        },
+        SECRET,
+        { expiresIn: '7d' }
+      );
+
+      res.json({
+        token,
+        user: {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          plan: user.plan || 'personal',
+          is_admin: user.is_admin || 0,
+        },
+      });
+    });
   });
 });
 
