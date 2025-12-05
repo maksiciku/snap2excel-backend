@@ -666,46 +666,26 @@ db.run(
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body || {};
 
-  console.log('LOGIN attempt:', email); // debug
+  console.log('LOGIN attempt:', email);
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Missing email or password' });
   }
 
-  // 🔹 1) DEMO GUEST ACCOUNT – works even with empty DB
-  if (
-    email === 'guest@snap2excel.com' &&
-    password === 'guest-demo'
-  ) {
-    console.log('Guest demo login OK');
-
-    const token = jwt.sign(
-      {
-        id: -1,
-        email,
-        name: 'Guest',
-        plan: 'personal',
-        is_admin: 0,
-      },
-      SECRET,
-      { expiresIn: '7d' }
-    );
-
-    return res.json({
-      token,
-      user: {
-        id: -1,
-        email,
-        name: 'Guest',
-        plan: 'personal',
-        is_admin: 0,
-      },
-    });
-  }
-
-  // 🔹 2) NORMAL USER LOGIN (DB)
-  const sql =
-    'SELECT id, email, name, password_hash, plan, is_admin FROM users WHERE email = ?';
+  const sql = `
+    SELECT
+      id,
+      email,
+      full_name,
+      password_hash,
+      plan_type,
+      is_admin,
+      account_type,
+      usage_mode,
+      experience_mode
+    FROM users
+    WHERE email = ?
+  `;
 
   db.get(sql, [email.toLowerCase()], (err, user) => {
     if (err) {
@@ -729,15 +709,10 @@ app.post('/api/login', (req, res) => {
         return res.status(400).json({ error: 'Wrong email or password' });
       }
 
+      // ✅ IMPORTANT: use JWT_SECRET (the one you defined at the top)
       const token = jwt.sign(
-        {
-          id: user.id,
-          email: user.email,
-          name: user.name,
-          plan: user.plan || 'personal',
-          is_admin: user.is_admin || 0,
-        },
-        SECRET,
+        { id: user.id },
+        JWT_SECRET,
         { expiresIn: '7d' }
       );
 
@@ -746,14 +721,18 @@ app.post('/api/login', (req, res) => {
         user: {
           id: user.id,
           email: user.email,
-          name: user.name,
-          plan: user.plan || 'personal',
-          is_admin: user.is_admin || 0,
+          full_name: user.full_name,
+          account_type: user.account_type,
+          plan_type: user.plan_type,
+          is_admin: user.is_admin,
+          usage_mode: user.usage_mode,
+          experience_mode: user.experience_mode,
         },
       });
     });
   });
 });
+
 
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
